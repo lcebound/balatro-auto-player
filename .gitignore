@@ -1,4 +1,4 @@
-# Publish source code only. Keep all runtime evidence and local resources private.
+# Publish source code and required UI templates; keep runtime evidence local.
 /*
 !/.gitignore
 !/README.md
@@ -37,3 +37,20 @@
 **/*.onnx
 **/*.pem
 **/*.key
+
+# Required runtime templates only; other images remain ignored.
+!/assets/
+/assets/*
+!/assets/ui/
+/assets/ui/*
+!/assets/ui/blind.png
+!/assets/ui/cashout.png
+!/assets/ui/deck.png
+!/assets/ui/guide.png
+!/assets/ui/hand_discard_control.png
+!/assets/ui/hand_play_control.png
+!/assets/ui/hand_sort_control.png
+!/assets/ui/loss.png
+!/assets/ui/main.png
+!/assets/ui/shop.png
+!/assets/ui/unlock.png
