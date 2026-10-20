@@ -24,7 +24,7 @@ from consumables import decide_consumable, state_after_consumable
 from types import SimpleNamespace
 from strategy import Joker, RunState, joker_name, _boss
 from vision import read_hand
-from recovery import ObservationError, begin_action, finish_action
+from recovery import ObservationError, HandPreviewError, HandPreviewConflict, begin_action, finish_action
 from runtime_issues import record_issue
 
 
@@ -127,7 +127,11 @@ def collect_jokers(session, image, state, *, force=False):
         token = round_token(state)
         remembered = getattr(session, 'hidden_joker_roster', None)
         if remembered is None or remembered[0] != token:
-            remembered = (token, limit, tuple(state.jokers))
+            # A resumed hidden roster already includes its previous action
+            # bounds. Do not apply those same plays/discards for a second time.
+            offsets = ((sum(state.round_played_types.values()), state.round_discards_used)
+                       if state.joker_order_unknown else (0, 0))
+            remembered = (token, limit, tuple(state.jokers), *offsets)
             session.hidden_joker_roster = remembered
         known = remembered[2]
         same_count = len(known) == count and remembered[1] == limit
@@ -137,22 +141,35 @@ def collect_jokers(session, image, state, *, force=False):
             known = tuple(Joker('Unknown hidden Joker', data=(('copyable', 0),))
                           for _ in range(count))
             session.hidden_joker_roster = (token, limit, known)
-        played = sum(state.round_played_types.values())
+        base_played, base_discards = remembered[3:5] if len(remembered) >= 5 else (0, 0)
+        played = max(0, sum(state.round_played_types.values()) - base_played)
+        discards = (max(0, state.round_discards_used - base_discards)
+                    if min(base_discards, state.round_discards_used) >= 0 else None)
         safe = []
         for joker in known:
             data, value = dict(joker.data), joker.value
             if joker.key == 'ice_cream':
-                initial = value if joker.numeric_value_available else value or 100
+                initial = value if joker.numeric_value_available else 0
                 value = max(0, initial - 5 * played)
-                data['observed_value'] = 1
-            elif joker.key in ('green_joker', 'ride_the_bus'):
-                value = 0  # Discards or face cards can reset/shrink this value.
-            elif joker.key in ('ramen', 'obelisk', 'hit_the_road'):
+            elif joker.key == 'green_joker':
+                value = (max(0, value + played - discards)
+                         if joker.numeric_value_available and discards is not None else 0)
+            elif joker.key == 'ramen':
+                # A discard contains at most five cards. Unknown discarded
+                # identities/counts cannot justify a more optimistic effect.
+                value = (max(1, value - .05 * discards)
+                         if joker.numeric_value_available and discards is not None else 1)
+            elif joker.key == 'ride_the_bus':
+                value = 0  # An intervening face-card score can reset it.
+            elif joker.key in ('obelisk', 'hit_the_road'):
                 value = 1
             elif joker.key == 'loyalty_card':
                 data['remaining'] = -1
             elif joker.key == 'seltzer':
                 data['remaining_hands'] = max(0, data.get('remaining_hands', 10) - played)
+            if joker.key in ('ice_cream', 'green_joker', 'ramen', 'ride_the_bus', 'obelisk', 'hit_the_road'):
+                data.pop('observed_value', None)
+                data['counter_lower_bound'] = 1
             safe.append(replace(joker, value=value, data=tuple(data.items())))
         session.log('hidden_joker_roster', keys=[j.key for j in safe],
                     observed_count=count, remembered_count=len(remembered[2]),
@@ -195,7 +212,8 @@ def collect_jokers(session, image, state, *, force=False):
                     # panels, whose +10 Mult/+50 Chips are independent bonuses.
                     effect_lines = tooltip_rows([word for word in words if abs(word[2][0] - x) < 140])
                 try:
-                    joker = parse_joker_tooltip(joker, labels, effect_lines=effect_lines)
+                    joker = parse_joker_tooltip(joker, labels, effect_lines=effect_lines,
+                                               image=tooltip, words=words)
                 except ObservationError:
                     # The title has already been proven. After local rereads,
                     # a declining numeric effect can use a lower bound.
@@ -206,6 +224,10 @@ def collect_jokers(session, image, state, *, force=False):
                 # readable name must not authorize an OCR-inflated XMult.
                 old = [j for j in state.jokers if j.key == key]
                 previous = old[0] if len(old) == 1 else None
+                if key == 'madness' and not (reuse and verified[index]):
+                    # A newly acquired same-name card does not inherit the
+                    # destroyed/replaced physical card's monotonic counter.
+                    previous = None
                 joker = verify_current_multiplier(tooltip, words, joker, state, previous)
                 if joker.get('counter_lower_bound'):
                     record_issue(session, 'joker_counter_bounded', level='degraded',
@@ -383,7 +405,7 @@ def collect_position(session, state, *, refresh_levels=False, initial_image=None
                     # readable active card retires that invisible uncertainty.
                     uncertain.discard(card.identity)
         state = replace(state, deck_cards=tuple(deck), unverified_chip_cards=tuple(sorted(uncertain)))
-    if state.boss.lower().removeprefix("the ") == "cerulean bell":
+    if _boss(state) == "cerulean_bell":
         flags = selection_flags(found)
         if len(flags) != 1:
             raise ObservationError("Cannot identify Cerulean Bell's forced card")
@@ -467,7 +489,9 @@ def select_verified(session, found, indices, reason):
 
 
 def verify_play_preview(session, image, category, *, hidden=False):
+    contrast, contradiction = False, False
     for attempt in range(3):
+        actual = None
         try:
             if hidden:
                 words = read_text(image, (150, 545, 535, 655))
@@ -479,15 +503,25 @@ def verify_play_preview(session, image, category, *, hidden=False):
                     raise ObservationError('Selected hidden-hand preview is not readable')
                 session.log('play_preview_verified', category='unknown', hidden=True)
                 return
-            actual = read_hand_preview(image)
+            actual = read_hand_preview(image, contrast=True) if contrast else read_hand_preview(image)
             if actual != category:
+                contradiction = True
                 raise ObservationError(f'Selected preview is {actual}, policy planned {category}')
             session.log('play_preview_verified', category=actual)
             return
         except ObservationError as error:
+            if isinstance(error, HandPreviewConflict):
+                contradiction = True
             session.log('play_preview_mismatch', expected=category, attempt=attempt + 1, error=str(error))
             if attempt == 2:
-                raise
+                raise HandPreviewError(str(error), cache_safe=not hidden and not contradiction) from error
+            if not hidden and attempt == 0 and actual is None and not contradiction:
+                # Spend the second of the same three reads on a different
+                # representation, replacing a sleep/capture/repeated OCR.
+                contrast = True
+                session.log('preview_read_variant', variant='same_frame_contrast')
+                continue
+            contrast = False
             time.sleep(.3)
             image = session.observe('verify-play-preview-again')
 

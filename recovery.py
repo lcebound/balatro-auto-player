@@ -17,6 +17,18 @@ class DesktopUnavailableError(ObservationError):
     """The game cannot receive input; wait without spending gameplay retries."""
 
 
+class HandPreviewError(ObservationError):
+    """A pre-click preview failed; only an unreadable title can retain caches."""
+
+    def __init__(self, message, *, cache_safe=False):
+        super().__init__(message)
+        self.cache_safe = cache_safe
+
+
+class HandPreviewConflict(ObservationError):
+    """Readable competing preview categories must be checked in a new frame."""
+
+
 def json_default(value):
     if isinstance(value, (set, frozenset)):
         return sorted(value)
@@ -197,6 +209,12 @@ def action_outcome(pending, scene, values):
             return None
         count = values['consumable_count']
         return True if count < before['consumable_count'] else (False if count == before['consumable_count'] else None)
+    if (kind == 'sell' and pending.get('details', {}).get('purpose') == 'disable_verdant_leaf'):
+        if scene != 'hand' or 'joker_count' not in values:
+            return None
+        if values['joker_count'] == before['joker_count'] - 1:
+            return True
+        return False if values['joker_count'] == before['joker_count'] else None
     if kind == 'sell' and scene == 'shop':
         if values.get('joker_count', before['joker_count']) < before['joker_count']:
             return True
@@ -293,20 +311,38 @@ def run_info_back(image):
     return buttons[0] if len(buttons) == 1 else None
 
 
-def recover_view(session):
+def recover_view(session, *, error=None):
     """Dismiss recognized overlays and request a fresh decision state."""
     from perception import read_text
     from vision import classify_scene
-    session.joker_cache = None
-    session.hand_cache = None
+    preserve = (isinstance(error, HandPreviewError) and error.cache_safe
+                and not getattr(session, 'pending_action', None))
+    def invalidate():
+        session.joker_cache = None
+        session.hand_cache = None
+        session.extra_offer_cache = None
+    if not preserve:
+        invalidate()
     try:
         image = session.observe('automatic-recovery')
     except ObservationError:
         if not hasattr(session, 'restore_geometry'):
             raise
+        preserve = False
+        invalidate()
         session.restore_geometry()
         image = session.observe('automatic-recovery-restored-window')
     scene = classify_scene(image)
+    if preserve and scene == 'hand':
+        # The failed preview preceded begin_action, so no game action was
+        # committed. Existing caches still require their normal fresh-pixel,
+        # count, round, metadata and dirty-effect checks on the next read.
+        session.hover(.93, .55, 'dismiss tooltip during preview recovery')
+        from hand_levels import sync_cache
+        sync_cache(session)
+        session.log('preview_recovery_cache_retained', scene=scene)
+        return
+    invalidate()
     modal_buttons = {'guide': (.90, .35), 'unlock': (.50, .75), 'unlock_reward': (.50, .71)}
     if scene in modal_buttons:
         session.tap(*modal_buttons[scene], 'dismiss recognized notice during recovery')

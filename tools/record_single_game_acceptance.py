@@ -1,4 +1,5 @@
 """Verify one autonomous whole game and the next game's independent start."""
+import argparse
 import json
 import sys
 from datetime import datetime
@@ -12,6 +13,14 @@ from recovery import atomic_json
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--settings-record', default='analysis/retained_run_evidence/game-speed-20261014/setting.json')
+    args = parser.parse_args()
+    settings_path = (ROOT / args.settings_record).resolve()
+    assert settings_path.is_relative_to(ROOT) and settings_path.is_file()
+    settings = json.loads(settings_path.read_text('utf-8-sig'))
+    speed = settings.get('game_speed', settings.get('speed'))
+    assert speed == 4, 'Expected verified 4x settings evidence'
     pointer = json.loads((ROOT / 'runs/active-batch.json').read_text('utf-8-sig'))
     run = Path(pointer['run_dir']).resolve()
     assert run.parent == (ROOT / 'runs').resolve()
@@ -40,7 +49,7 @@ def main():
         first_game=game, first_end_event=first, terminal_screenshot=terminal_frame,
         second_game_start=second, second_hand_screenshot=second_frame,
         handoff_status=status, manual_gameplay_interventions=0,
-        settings_navigation_record='analysis/retained_run_evidence/game-speed-20261014/setting.json')
+        settings_navigation_record=str(settings_path.relative_to(ROOT)))
     atomic_json(ROOT / 'analysis' / (run.name + '-acceptance.json'), report)
     print(json.dumps(dict(batch=run.name, result=first['result'],
                          finished=status['finished_games'], current_game=status['current_game'])))

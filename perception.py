@@ -20,7 +20,7 @@ import numpy as np
 from PIL import Image
 
 from strategy import Card, Joker, RunState, ShopItem, SUITS, joker_name, HAND_ALIASES
-from recovery import ObservationError
+from recovery import ObservationError, HandPreviewConflict
 
 ROOT = Path(__file__).resolve().parent
 
@@ -105,6 +105,42 @@ def read_text(image, region=None, *, line=False):
     return words
 
 
+def read_offer_price(image, text, confidence, center):
+    """Resolve suspicious prices from the existing frame, never a price list.
+
+    Ordinary prices use the existing OCR result. A large value (including
+    legitimate inflation) requires two agreeing, reliable narrow reads. No
+    fresh screenshot, hover or wait is introduced.
+    """
+    def parse(label):
+        match = re.fullmatch(r'\$(\d[\d,]*)', label.strip())
+        return int(match[1].replace(',', '')) if match else None
+
+    original = parse(text)
+    if original is None or confidence <= .8:
+        raise ObservationError(f'Unreadable shop price: {text!r}')
+    if original < 40:
+        return original
+    x, y = map(int, center)
+    height, width = image.shape[:2]
+    values = []
+    for half_width, half_height, line in ((65, 28, False), (65, 28, True), (55, 25, True)):
+        region = (max(0, x - half_width), max(0, y - half_height),
+                  min(width, x + half_width), min(height, y + half_height))
+        reads = {parse(t) for t, score, (px, py) in read_text(image, region, line=line)
+                 if score > .9 and abs(px - x) <= 30 and abs(py - y) <= 18
+                 and parse(t) is not None}
+        if len(reads) > 1:
+            raise ObservationError(f'Conflicting local shop prices: {reads}')
+        if reads:
+            values.append(reads.pop())
+        if len(set(values)) > 1 or confidence > .9 and values and values[-1] != original:
+            raise ObservationError(f'Conflicting shop price: {text!r}, local={values}')
+        if len(values) >= 2:
+            return values[0]
+    raise ObservationError(f'Cannot verify suspicious shop price: {text!r}, local={values}')
+
+
 def numeric(text):
     """Balatro uses commas, scientific notation and coloured pixel digits."""
     cleaned = text.strip().replace(",", "").replace(" ", "").replace("$", "")
@@ -116,7 +152,10 @@ def numeric(text):
 def score_numeric(text):
     """Integer score displays may have a dot misread in place of a comma."""
     text = text.strip().lstrip('#').strip()
-    if re.fullmatch(r'\d{1,3}(?:[.,]\d{3})+', text):
+    # Pixel-font commas can be detected as an adjacent dot/comma pair, e.g.
+    # the real 38,852 cashout read as 38.,852. Require exact 3-digit groups;
+    # ordinary decimals and scientific notation retain numeric() semantics.
+    if re.fullmatch(r'\d{1,3}(?:[.,]{1,2}\d{3})+', text):
         return float(text.replace('.', '').replace(',', ''))
     return numeric(text)
 
@@ -582,6 +621,30 @@ def shop_tooltip_region(image, card_x):
     """Locate the grey tooltip panel to the left of a hovered shop card."""
     left, top, right, bottom = 535, 350, max(1670, min(2040, int(card_x + 230))), 900
     hsv = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2HSV)
+    # CRT tint can disconnect the grey border or join it to the shop buttons.
+    # Anchor on the filled white effect body instead, requiring grey title
+    # and footer bands on the same horizontal span. A card face or a thin
+    # panel outline alone cannot establish this tooltip geometry.
+    body_mask = ((hsv[:, :, 1] < 80) & (hsv[:, :, 2] > 180)).astype(np.uint8) * 255
+    body_mask = cv2.morphologyEx(body_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    _, _, bodies, _ = cv2.connectedComponentsWithStats(body_mask)
+    body_candidates = []
+    for bx, by, bw, bh, area in bodies[1:]:
+        bx, by, bw, bh, area = map(int, (bx, by, bw, bh, area))
+        gap = card_x - (left + bx + bw)
+        if not (150 < bw < 650 and 45 < bh < 400 and area / (bw * bh) >= .5
+                and 45 < gap < 380 and top + by < 740
+                and by >= 55 and by + bh + 55 <= hsv.shape[0]):
+            continue
+        bands = (hsv[by - 55:by - 10, bx:bx + bw],
+                 hsv[by + bh + 5:by + bh + 55, bx:bx + bw])
+        if not all(float(np.mean((band[:, :, 1] < 90) & (band[:, :, 2] > 60)
+                                 & (band[:, :, 2] < 180))) >= .35 for band in bands):
+            continue
+        body_candidates.append((abs(gap - 100), -area,
+            (max(left, left + bx - 12), max(top, top + by - 65),
+             min(right, left + bx + bw + 12), min(bottom, top + by + bh + 65))))
+    body_region = min(body_candidates)[2] if body_candidates else None
     mask = ((hsv[:, :, 1] < 40) & (hsv[:, :, 2] > 75)).astype(np.uint8) * 255
     _, original_labels, original_components, _ = cv2.connectedComponentsWithStats(mask)
     # A selected card can move its tooltip against a related enhancement
@@ -619,6 +682,8 @@ def shop_tooltip_region(image, card_x):
                 and 45 < gap < 380 and y < 740):
             candidates.append((abs(gap - 90), -int(area), (x, y, x + width, y + height)))
     if not candidates:
+        if body_region is not None:
+            return body_region
         raise ObservationError('Shop tooltip panel is not visible; refusing a whole-screen identity guess')
     x1, y1, x2, y2 = min(candidates)[2]
     # The title and rarity sit on darker grey than the white effect body.
@@ -626,10 +691,20 @@ def shop_tooltip_region(image, card_x):
     # panel. Keep those rows without including a neighbouring card's artwork.
     if y2 - y1 < 135:
         y1, y2 = max(top, y1 - 75), min(bottom, y2 + 80)
-    return max(left, x1 - 12), y1, min(right, x2 + 12), y2
+    region = max(left, x1 - 12), y1, min(right, x2 + 12), y2
+    # Keep an already complete, tightly bounded outer frame. Changing a valid
+    # crop can itself perturb OCR (notably the selected Fool title). Replace
+    # only a clipped title/footer or a span leaking into neighbouring buttons.
+    if body_region is not None:
+        bx1, by1, bx2, by2 = body_region
+        if (region[0] < bx1 - 20 or region[2] > bx2 + 20
+                or region[1] > by1 + 20 or region[3] < by2 - 20):
+            return body_region
+    return region
 
 
-def shop_offer_item(labels, price, hint='', *, require_supported=True, art_confidence=0):
+def shop_offer_item(labels, price, hint='', *, require_supported=True, art_confidence=0,
+                    image=None, words=None):
     """Identify a named offer, including its live effect and safe consumables."""
     joker_identity = None
     if any(label.strip().lower() in ('common', 'uncommon', 'rare', 'legendary') for label in labels):
@@ -644,7 +719,7 @@ def shop_offer_item(labels, price, hint='', *, require_supported=True, art_confi
             pass
     if joker_identity is not None:
         key, confidence = joker_identity
-        joker = parse_joker_tooltip(joker_from_definition(key), labels)
+        joker = parse_joker_tooltip(joker_from_definition(key), labels, image=image, words=words)
         return ShopItem('joker', joker.name, price, joker=joker, edition=joker.edition), confidence
     key, confidence = identify_consumable_text(labels, title=labels[0] if labels else None)
     consumable = consumable_templates()[1][key]
@@ -765,7 +840,82 @@ def joker_from_definition(key):
                  data=(("copyable", float(definition.copyable)),))
 
 
-def parse_joker_tooltip(joker, lines, *, effect_lines=None):
+def read_ramen_multiplier(image, words):
+    """Recover a red counter from its proven first effect row, on the same frame.
+
+    Ordinary readable tooltips never call this. Neither the title, shop price
+    nor Ramen's initial X2 is evidence of its current counter.
+    """
+    if not words:
+        return None
+    titles = [w for w in words if w[0].strip().casefold() == 'ramen' and w[1] >= .8]
+    if len(titles) != 1:
+        return None
+    tx, ty = titles[0][2]
+    anchors = [w for w in words if re.search(r'\bmult\b', w[0], re.I)
+               and 'loses' not in w[0].casefold() and w[1] >= .8
+               and abs(w[2][0] - tx) < 120 and ty + 15 <= w[2][1] <= ty + 100]
+    if not anchors:
+        return None
+    first_y = min(w[2][1] for w in anchors)
+    anchors = [w for w in anchors if abs(w[2][1] - first_y) <= 8]
+    if len(anchors) != 1:
+        return None
+    x, y = anchors[0][2]
+    a, b, c, e = map(int, (max(525, x - 180), max(330, y - 14),
+                           min(2020, x + 250), min(1000, y + 15)))
+    pixels = image[b:e, a:c]
+    if not pixels.size:
+        return None
+    blue, green, red = [pixels[:, :, i].astype(np.float32) for i in range(3)]
+    mask = ((red > 150) & (red > green * 1.4) & (red > blue * 1.4)).astype(np.uint8) * 255
+    _, _, components, _ = cv2.connectedComponentsWithStats(mask)
+    boxes = [(int(xx), int(yy), int(w), int(h)) for xx, yy, w, h, _ in components[1:]
+             if 18 <= w <= 90 and h >= 20 and abs(a + xx + w / 2 - x) <= 80]
+    if len(boxes) != 1:
+        return None
+    xx, yy, width, height = boxes[0]
+    region = (max(a, a + xx - 8), max(330, b - 5), min(c, a + xx + width + 8), e + 5)
+    gray = cv2.cvtColor(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    contrast = cv2.convertScaleAbs(gray, alpha=1.6, beta=-50)
+    glyph = 255 - mask[:, max(0, xx - 6):min(mask.shape[1], xx + width + 6)]
+    glyph = cv2.copyMakeBorder(glyph, 7, 7, 7, 7, cv2.BORDER_CONSTANT, value=0)
+    glyph = cv2.cvtColor(glyph, cv2.COLOR_GRAY2BGR)
+    votes = Counter()
+    def add_vote(view, crop):
+        labels = [w[0].strip() for w in read_text(view, crop, line=True) if w[1] >= .8]
+        text = ' '.join(labels)
+        # This crop contains only the red factor field, not the decay/body.
+        # OCR can omit X or turn it into H; no decimal is ever inserted.
+        match = re.fullmatch(r'[\[({]*\s*[xX×H]?\s*(\d+(?:\.\d+)?)\s*[\])}]*', text)
+        if match:
+            value = float(match[1])
+            if 1 <= value <= 2:
+                votes[value] += 1
+    add_vote(contrast, region)
+    contrast_proven = bool(votes)
+    add_vote(glyph, (0, 0, glyph.shape[1], glyph.shape[0]))
+    if len(votes) > 1:
+        return None
+    if sum(votes.values()) < 2:
+        if contrast_proven:
+            add_vote(image, region)
+        else:
+            # With no usable first view, two isolated glyph layouts must prove
+            # the number. A single confident digit still cannot authorize it.
+            padding = (6,) if votes else (8, 10)
+            for pad in padding:
+                positive = cv2.copyMakeBorder(mask[yy:yy + height, xx:xx + width],
+                                             pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+                positive = cv2.resize(positive, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+                positive = cv2.cvtColor(positive, cv2.COLOR_GRAY2BGR)
+                add_vote(positive, (0, 0, positive.shape[1], positive.shape[0]))
+                if len(votes) > 1:
+                    return None
+    return next(iter(votes)) if len(votes) == 1 and sum(votes.values()) >= 2 else None
+
+
+def parse_joker_tooltip(joker, lines, *, effect_lines=None, image=None, words=None):
     """Current counters override static defaults only when explicitly observed."""
     text = " ".join(lines)
     value = joker.value
@@ -835,6 +985,12 @@ def parse_joker_tooltip(joker, lines, *, effect_lines=None):
         amounts = {float(amount) for amount in re.findall(direct_effects[joker.key], primary, re.I)}
         if joker.key == 'ramen':
             amounts = {amount for amount in amounts if amount >= 1}  # Exclude X0.01 decay.
+            if not amounts and image is not None:
+                recovered = read_ramen_multiplier(image, words)
+                if recovered is not None:
+                    amounts = {recovered}
+            if any(amount > 2 for amount in amounts):
+                raise ObservationError('Current Ramen effect exceeds its physical maximum')
         if len(amounts) != 1:
             raise ObservationError('Current ' + joker.name + ' effect is unreadable or ambiguous')
         value = amounts.pop()
@@ -913,6 +1069,24 @@ def verify_current_multiplier(image, words, joker, state, previous=None):
     if fortune and previous is not None and previous.numeric_value_available:
         # All physical Fortune Tellers share a monotonically growing run tally.
         lower = previous.value
+    if joker.key == 'madness':
+        # Each non-Boss selection grants at most X0.5. Ante-reducing vouchers
+        # can revisit earlier Antes, so account for both owned reductions.
+        reductions = sum(joker_name(v) in ('hieroglyph', 'petroglyph') for v in state.owned_vouchers)
+        selections = 2 * max(0, state.ante - 1 + reductions) + min(2, max(0, state.blind_index + 1))
+        upper = min(1 + .5 * selections, 1 + .5 * (state.total_hands_played + 1))
+        if (previous is not None and previous.key == joker.key and previous.numeric_value_available
+                and 1 <= previous.value <= upper + 1e-6):
+            lower = previous.value
+    if joker.key == 'obelisk':
+        upper = 1 + .2 * max(0, state.total_hands_played)
+        # A lower bound cannot bound the next actual value from above. Only a
+        # confirmed previous counter on this unique physical copy can do so.
+        if (previous is not None and previous.key == joker.key
+                and previous.get('observed_value') and 1 <= previous.value <= upper + 1e-6):
+            at = previous.get('value_observed_at_hand', -1)
+            if 0 <= at <= state.total_hands_played:
+                upper = min(upper, previous.value + .2 * (state.total_hands_played - at))
     if joker.key == 'vampire':
         # At most five scoring enhancements can be removed by one play.
         upper = 1 + .5 * state.total_hands_played
@@ -927,17 +1101,27 @@ def verify_current_multiplier(image, words, joker, state, previous=None):
         x, y = anchors[0][2]
         region = (max(525, x - 140), max(330, y - 22), min(2020, x + 300), min(850, y + 22))
         gray = cv2.cvtColor(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-        for pixels in (image, gray):
-            for single_line in (True, False):
-                read = read_text(pixels, region, line=single_line)
-                labels = tooltip_rows([w for w in read if w[1] >= .75])
-                value = (current_fortune_mult if fortune else current_multiplier)(' '.join(labels))
-                if value is not None and lower - 1e-6 <= value <= upper + 1e-6:
-                    votes[value] += 1
+        views = [(pixels, region, line) for pixels in (image, gray) for line in (True, False)]
+        if joker.key == 'madness':
+            # Still four reads. Tight views separate the current counter from
+            # the destruction line and the neighbouring edition panel.
+            tight = (region[0], max(330, y - 15), region[2], min(850, y + 15))
+            views = [(image, region, True), (gray, region, False),
+                     (image, tight, True), (image, tight, False)]
+        for pixels, crop, single_line in views:
+            read = read_text(pixels, crop, line=single_line)
+            labels = tooltip_rows([w for w in read if w[1] >= .75])
+            text = ' '.join(labels)
+            if joker.key == 'madness':
+                # Scoped Currently row only; H is a verified X OCR variant.
+                text = re.sub(r'(Currently[\s:\[({]*)H(?=\s*\d)', r'\1X', text, flags=re.I)
+            value = (current_fortune_mult if fortune else current_multiplier)(text)
+            if value is not None and lower - 1e-6 <= value <= upper + 1e-6:
+                votes[value] += 1
     data = dict(joker.data)
     ordered = votes.most_common()
     if ordered and ordered[0][1] >= 2 and (len(ordered) == 1 or
-            (not fortune and ordered[0][1] > ordered[1][1])):
+            (not fortune and joker.key != 'madness' and ordered[0][1] > ordered[1][1])):
         data['observed_value'] = 1
         data['value_observed_at_hand'] = state.total_hands_played
         data.pop('counter_lower_bound', None)
@@ -1069,8 +1253,30 @@ def blind_names():
 def read_future_boss(image):
     """Read the visible Boss column while all three blinds are displayed."""
     words = read_text(image, (1340, 445, 1650, 975))
-    names = {' '.join(text.split()) for text, confidence, _ in words
-             if confidence >= .85 and ' '.join(text.split()) in blind_names()}
+    titles = [(t, c, p) for t, c, p in words if 445 <= p[1] <= 635]
+    candidates = [t for t, c, p in titles if c >= .85] + tooltip_rows(titles, minimum=.85)
+    names = {name for name in blind_names() for text in candidates
+             if ' '.join(text.split()).casefold() == name.casefold()}
+    if not names and titles:
+        # A split Verdant / t Leaf title is repaired on the same frame.
+        # Similarity chooses only a crop, never a Boss identity.
+        anchor = max(titles, key=lambda w: max(SequenceMatcher(None,
+            w[0].casefold(), name.casefold()).ratio() for name in blind_names()))[2][1]
+        local = read_text(image, (1340, anchor - 31, 1650, anchor + 31), line=True)
+        names = {name for text, confidence, _ in local if confidence > .9
+                 for name in blind_names() if text.strip().casefold() == name.casefold()}
+        body = ' '.join(t.lower() for t, c, p in words if c > .9)
+        # Only observed pixel-font confusions, corroborated by unique rule
+        # text from this same Boss column. No general fuzzy-title acceptance.
+        aliases = (
+            ('Verdant Leaf', {'uerdant leaf'}, ('all cards debuffed', 'until 1 joker sold')),
+            ('Violet Vessel', {'violet uessel', 'uiolet vessel', 'vialet uessel'}, ('very large blind',)),
+            ('The Ox', {'the 0x'}, ('playing a', 'sets money to $0')),
+        )
+        if not names:
+            names = {name for name, variants, rules in aliases
+                     if any(t.strip().casefold() in variants and c > .9 for t, c, p in local)
+                     and all(rule in body for rule in rules)}
     targets = {score_numeric(text) for text, confidence, (_, y) in words
                if confidence >= .85 and 700 <= y <= 925 and '$' not in text}
     targets = {value for value in targets if value is not None and value >= 100}
@@ -1097,6 +1303,13 @@ def observed_state(image, previous: RunState):
             values["boss"] = text
     if any("Blind" in line for line in boss_lines):
         values["boss"] = ""
+    if replace(previous, **values)._boss_name == 'ox':
+        from strategy import hand_name
+        targets = {hand_name(match[1]) for line in boss_lines
+                   if (match := re.fullmatch(r'Playing\s+(?:a|an)\s+(.+)', line.strip(), re.I))}
+        targets &= set(HAND_ALIASES.values())
+        if len(targets) == 1:
+            values['boss_target_hand'] = targets.pop()
     return replace(previous, **values), count
 
 
@@ -1139,8 +1352,18 @@ def recognize_hand_name(text):
     return None
 
 
-def read_hand_preview(image):
-    words = read_text(image, (150, 545, 535, 655))
+def read_hand_preview(image, *, contrast=False):
+    if contrast:
+        # A different observation of the same verified selection, without
+        # another screenshot, hover or animation wait. Keep the same bounds
+        # and acceptance rules; never condition OCR on the planned category.
+        crop = image[545:655, 150:535]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 170, 255, cv2.THRESH_BINARY)
+        words = [(text, score, (x + 150, y + 545)) for text, score, (x, y)
+                 in read_text(cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR))]
+    else:
+        words = read_text(image, (150, 545, 535, 655))
     return parse_hand_preview(words)
 
 
@@ -1166,11 +1389,22 @@ def parse_hand_preview(words):
     # Parse full rows: "Pair" inside "Two Pair", or "Flush" inside
     # "Straight Flush", is not a second competing hand category.
     for row in rows:
-        text = ' '.join(w[0] for w in sorted(row, key=lambda w: w[2][0]))
+        ordered = sorted(row, key=lambda w: w[2][0])
+        text = ' '.join(w[0] for w in ordered)
         title = re.split(r'\b(?:lvl|lv|lul|lvi)[.\s]*\d', text, flags=re.I)[0].strip()
         category = recognize_hand_name(title)
+        if category is None and len(ordered) > 1:
+            # The small level suffix can read as 141.4 or l41.1 while the
+            # complete hand title is exact. This proves only the category;
+            # read_hand_preview_level still requires a readable level.
+            suffix = ordered[-1][0].strip()
+            if (len(suffix) <= 12 and re.fullmatch(r'[lviu\d.\u03c8]+\.\d+', suffix, re.I)
+                    and ordered[-1][2][0] > ordered[-2][2][0] + 15):
+                category = HAND_ALIASES.get(' '.join(w[0] for w in ordered[:-1]).strip().lower())
         if category:
             categories.add(category)
-    if len(categories) != 1:
+    if len(categories) > 1:
+        raise HandPreviewConflict('Selected hand preview contains conflicting categories: ' + ', '.join(sorted(categories)))
+    if not categories:
         raise ObservationError('Selected hand preview category is not readable or unique')
     return categories.pop()

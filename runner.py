@@ -13,7 +13,7 @@ from controller import collect_position, select_verified, apply_play_order, coll
 from perception import (read_text, read_numbers, read_jokers, joker_from_definition,
                         identify_joker_text, tooltip_labels, consumable_counter,
                         shop_offer_item, read_reroll_button, joker_slots, shop_tooltip_region, tooltip_rows)
-from perception import read_future_boss, victory_new_run
+from perception import read_future_boss, victory_new_run, read_offer_price
 from perception import supported_shop_item
 from recovery import (ObservationError, DesktopUnavailableError, begin_action, finish_action, confirm_pending,
                       recover_view, run_info_back, atomic_json, state_from_dict)
@@ -63,7 +63,8 @@ def verify_selected_purchase(image, chosen, x):
     labels = [label for label in labels if label.strip() != 'JOKER']
     art = read_jokers(image, (960, 350, 1930, 800)) if chosen.name == 'Misprint' else []
     hint = min(art, key=lambda match: abs(match[2][0] - x)) if art else (0, '', None)
-    actual, _ = shop_offer_item(labels, chosen.price, hint[1], art_confidence=hint[0])
+    actual, _ = shop_offer_item(labels, chosen.price, hint[1], art_confidence=hint[0],
+                               image=image, words=words)
     if actual.kind != chosen.kind or actual.name != chosen.name:
         raise ObservationError('Selected shop item differs from the purchase plan')
 
@@ -111,6 +112,7 @@ def play_one_hand(session, discards=4, target=300, round_score=0, hands_left=4):
     refresh = getattr(session, "refresh_levels", True)
     initial_image = getattr(session, 'scene_hand_frame', None)
     session.scene_hand_frame = None
+    state, initial_image = prepare_boss_action(session, state, initial_image)
     for attempt in range(32):
         state, found = collect_position(session, state, refresh_levels=refresh,
                                         initial_image=initial_image)
@@ -206,7 +208,36 @@ def play_one_hand(session, discards=4, target=300, round_score=0, hands_left=4):
     raise RuntimeError("Hand did not finish after 32 action cycles")
 
 
-def sell_shop_joker(session, state, index):
+def prepare_boss_action(session, state, image=None):
+    """Resolve required Boss actions before card discovery or discard search."""
+    from strategy import _boss
+    from perception import observed_state
+    from boss_policy import choose_verdant_sale
+    if (state.blind_index != 2 or state.boss_disabled or state.has('chicot')
+            or state.boss and _boss(state) != 'verdant_leaf'):
+        return state, image
+    if getattr(session, 'pending_action', None):
+        raise ObservationError('Confirm the pending action before preparing a Boss')
+    image = image if image is not None else session.observe('boss-preparation-state')
+    state, _ = observed_state(image, state)
+    if _boss(state) != 'verdant_leaf':
+        return state, image
+    state = collect_jokers(session, image, state)
+    index = choose_verdant_sale(state)
+    if index is None:
+        session.log('boss_preparation_unavailable', boss=state.boss,
+                    reason='no verified sellable Joker; play with the active debuff')
+        return state, image
+    session.log('boss_preparation_decision', boss=state.boss, action='sell_joker',
+                index=index, name=state.jokers[index].name,
+                reason='disable Verdant Leaf before spending discards')
+    state = sell_shop_joker(session, state, index, disable_leaf=True)
+    image = getattr(session, 'boss_after_sale_frame', None)
+    session.boss_after_sale_frame = None
+    return state, image
+
+
+def sell_shop_joker(session, state, index, *, disable_leaf=False):
     old = state.jokers[index]
     if old.get('eternal'):
         raise ObservationError('Refusing to sell an Eternal Joker')
@@ -226,10 +257,22 @@ def sell_shop_joker(session, state, index):
     after = replace(state, jokers=tuple(j for i, j in enumerate(state.jokers) if i != index),
                     total_joker_slots=state.total_joker_slots - (old.edition == 'negative'))
     after = replace(after, hand_size=max(1, state.hand_size + joker_hand_size_delta(state.jokers, after.jokers)))
+    if disable_leaf:
+        from strategy import _boss
+        from boss_policy import after_joker_sale
+        if _boss(state) != 'verdant_leaf':
+            raise ObservationError('Boss sale is only authorized for active Verdant Leaf')
+        after = after_joker_sale(state, index, disable_leaf=True)
     begin_action(session, 'sell', {'joker_count': len(state.jokers), 'money': state.money},
-                 after_state=after, name=old.name)
+                 after_state=after, name=old.name,
+                 **({'purpose': 'disable_verdant_leaf'} if disable_leaf else {}))
     session.tap(button[0] / 2064, button[1] / 1191, 'sell weak Joker for a scoring replacement')
     confirm_pending(session)
+    if disable_leaf:
+        session.hand_cache = None  # The sale changes every card's debuff metadata.
+        image = session.observe('boss-after-verified-joker-sale')
+        session.boss_after_sale_frame = image
+        return replace(session.policy_state, **read_numbers(image))
     image = session.observe('shop-after-joker-sale')
     return collect_shop_jokers(session, image, replace(session.policy_state, **read_numbers(image)))
 
@@ -266,6 +309,7 @@ def shop(session, image):
     state = collect_shop_jokers(session, image, state)
     blocked_offers = set()
     unsupported_offers = {}
+    unreadable_offers = {}
     for attempt in range(14):
         observation_started = time.perf_counter()
         image = session.observe("shop-offers")
@@ -278,9 +322,16 @@ def shop(session, image):
                         if text.strip().startswith('$') and score > .8 and center[1] < 500]
         for text, confidence, (x, py) in price_labels:
             try:
-                price = int(text.strip().replace("$", "").replace(",", ""))
-            except ValueError:
+                price = read_offer_price(image, text, confidence, (x, py))
+            except ObservationError as error:
+                if getattr(session, 'pending_action', None):
+                    raise
+                record_issue(session, 'shop_offer_price_unreadable', level='degraded',
+                    code='optional_offer_price_unreadable', message='Skip an unverified optional shop price',
+                    error=str(error), text=text, position=(x, py))
                 continue
+            if price != int(text.strip().replace('$', '').replace(',', '')):
+                session.log('shop_price_recovered', original=text, price=price, position=(x, py))
             y = py + 140
             art = min(matches, key=lambda match: abs(match[2][0] - x)) if matches else (0, '', None)
             hint = art[1]
@@ -290,6 +341,10 @@ def shop(session, image):
             if cached and same_offer_art(image, (x, y), cached[1]):
                 session.log('shop_offer_unsupported_reused', name=cached[0].name, price=price)
                 continue
+            rejected = unreadable_offers.get(cache_key)
+            if rejected is not None and same_offer_art(image, (x, y), rejected):
+                session.log('shop_offer_unreadable_reused', price=price)
+                continue
             session.hover(x / 2064, y / 1191, 'confirm shop offer title before evaluation')
             tooltip_image = session.observe('shop-offer-tooltip')
             labels = []
@@ -298,13 +353,17 @@ def shop(session, image):
                 labels = tooltip_rows(tooltip_words)
                 labels = [label for label in labels if label.strip() != 'JOKER']
                 item, name_confidence = shop_offer_item(labels, price, hint,
-                    require_supported=False, art_confidence=art[0])
+                    require_supported=False, art_confidence=art[0],
+                    image=tooltip_image, words=tooltip_words)
                 if item.joker is not None:
                     item = replace(item, joker=verify_current_multiplier(
                         tooltip_image, tooltip_words, item.joker, state))
             except DesktopUnavailableError:
                 raise
             except ObservationError as error:
+                if getattr(session, 'pending_action', None):
+                    raise
+                unreadable_offers[cache_key] = offer_art_patch(image, (x, y))
                 record_issue(session, 'shop_offer_unknown', level='degraded',
                     code='optional_offer_unreadable', message='Skip an unreadable optional shop offer',
                     error=str(error), price=price, tooltip=labels)
@@ -366,6 +425,7 @@ def shop(session, image):
             state = session.policy_state
             blocked_offers.clear()
             unsupported_offers.clear()
+            unreadable_offers.clear()
             continue
         if decision.action != "buy":
             break
@@ -457,6 +517,23 @@ def prepare_new_run(session, image):
     return play[0] / 2064, play[1] / 1191
 
 
+def reset_game_state(session):
+    """Clear per-game observations, never an unconfirmed action journal."""
+    session.policy_state = RunState(objective='survival')
+    session.joker_cache = None
+    session.hand_cache = None
+    session.extra_offer_cache = None
+    session.hidden_joker_roster = None
+    session.blocked_consumable_orders = set()
+    session.scene_hand_frame = None
+    session.boss_after_sale_frame = None
+    session.play_order_fallback = False
+    session._last_observation = None
+    session.refresh_levels = True
+    session.levels_dirty = True
+    session.levels_cache = {}
+
+
 def run_batch(session, target_games, max_actions=None, resume=False):
     if max_actions is None:
         max_actions = max(2000, target_games * 2000)
@@ -465,12 +542,7 @@ def run_batch(session, target_games, max_actions=None, resume=False):
     consecutive_recoveries, total_recoveries = 0, 0
     awaiting_new_game, game_active = False, False
     starting_fresh = not resume
-    session.policy_state = RunState(objective='survival')
-    session.joker_cache = None
-    session.hand_cache = None
-    session.refresh_levels = True
-    session.levels_dirty = True
-    session.levels_cache = {}
+    reset_game_state(session)
     if resume and (session.run_dir / 'status.json').exists():
         previous = json.loads((session.run_dir / 'status.json').read_text(encoding='utf-8'))
         finished = previous['finished_games']
@@ -541,12 +613,7 @@ def run_batch(session, target_games, max_actions=None, resume=False):
         session.log("game_end", number=finished, result=result, automatic_recoveries=total_recoveries)
         finish_issue_review(session, finished, result)
         preserve_history()
-        session.policy_state = RunState(objective='survival')
-        session.joker_cache = None
-        session.hand_cache = None
-        session.refresh_levels = True
-        session.levels_dirty = True
-        session.levels_cache = {}
+        reset_game_state(session)
         save_status("complete" if finished >= target_games else "running")
         if finished >= target_games:
             session.log("batch_complete", finished_games=finished)
@@ -638,11 +705,13 @@ def run_batch(session, target_games, max_actions=None, resume=False):
                     upcoming = read_future_boss(image)
                     numbers = read_numbers(image)
                     ante = numbers.get('ante', session.policy_state.ante)
-                    if upcoming:
-                        name, target = upcoming
-                        session.policy_state = replace(session.policy_state, upcoming_boss=name,
-                            upcoming_boss_target=target, upcoming_boss_ante=ante)
+                    from boss_policy import BOSS_TACTICS, future_boss_weight, remember_upcoming_boss
+                    session.policy_state = remember_upcoming_boss(session.policy_state, ante, upcoming)
+                    from strategy import joker_name
+                    known = session.policy_state.upcoming_boss
+                    tactic = BOSS_TACTICS.get(joker_name(known).removeprefix('the_'))
                     session.log("blind_decision", blind=blind, upcoming_boss=upcoming,
+                                boss_tactic=tactic, future_boss_weight=future_boss_weight(ante),
                                 reason="play available blind")
                     session.tap((.36, .54, .72)[blind], .35, "select blind")
                     session.policy_state = replace(session.policy_state, round_score=0,
@@ -698,7 +767,7 @@ def run_batch(session, target_games, max_actions=None, resume=False):
                 if consecutive_recoveries > 5:
                     raise RuntimeError('Automatic recovery exhausted after five attempts') from error
                 try:
-                    recover_view(session)
+                    recover_view(session, error=error)
                 except DesktopUnavailableError as recovery_error:
                     wait_for_desktop(recovery_error)
                 except ObservationError as recovery_error:

@@ -186,6 +186,12 @@ def extra_is_worth_considering(item, state, forecast):
         if key in ('seed_money', 'money_tree'):
             return left >= state.interest_cash_cap and state.ante <= 6
         return left >= (0 if immediate else 15)
+    if (state.ante >= 8 and state.blind_index == 1 and forecast.weak
+            and item.kind in ('celestial_pack', 'arcana_pack')):
+        # There is no later shop before the goal. When known upgrades/search
+        # cannot rescue the Boss, an affordable usable pack may spend the
+        # usual interest reserve. Contents stay unknown in the score forecast.
+        return True
     if item.kind == 'buffoon_pack':
         return len(state.jokers) < state.total_joker_slots and left >= (
             0 if not state.jokers else 6)
@@ -307,11 +313,26 @@ def offer_labels(image, center, *, hand=False):
 
 
 def collect_extra_offers(session, image):
-    from perception import read_text
+    from perception import read_text, read_offer_price
+    from runtime_issues import record_issue
     words = read_text(image, (810, 750, 1770, 890))
-    prices = [(int(text.strip()[1:]), (x, py)) for text, confidence, (x, py) in words
-              if confidence > .8 and re.fullmatch(r'\$\d+', text.strip())
-              and 810 <= x <= 1770 and 750 <= py <= 890]
+    prices = []
+    for text, confidence, (x, py) in words:
+        if not (confidence > .8 and re.fullmatch(r'\$\d+', text.strip())
+                and 810 <= x <= 1770 and 750 <= py <= 890):
+            continue
+        try:
+            price = read_offer_price(image, text, confidence, (x, py))
+        except ObservationError as error:
+            if getattr(session, 'pending_action', None):
+                raise
+            record_issue(session, 'extra_offer_price_unreadable', level='degraded',
+                code='optional_offer_price_unreadable', message='Skip an unverified optional shop price',
+                error=str(error), text=text, position=(x, py))
+            continue
+        if price != int(text.strip()[1:]):
+            session.log('shop_price_recovered', original=text, price=price, position=(x, py))
+        prices.append((price, (x, py)))
     prices.sort(key=lambda row: row[1][0])
     cache = getattr(session, 'extra_offer_cache', None)
     if cache and len(prices) == len(cache['prices']) and all(

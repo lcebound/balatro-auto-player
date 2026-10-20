@@ -111,6 +111,57 @@ def economy_value(state, forecast):
     return value
 
 
+def safe_economy_investment(state, after, before, projected, joker, sell_index=-1):
+    """Allow modest surplus-score loss for an early, funded income engine.
+
+    Uses existing round forecasts only. Sale-value growth is not spendable
+    income, and temporary score cannot substitute for sustainable headroom.
+    """
+    from planning import GROWTH_JOKERS
+    if (state.ante > 3 or after.money < 5 or investment_rounds(state) < 3
+            or before.coverage < 1.5 or projected.coverage < 1.5
+            or projected.clear_rate < max(.85, before.clear_rate)
+            or projected.sustainable_score < 1.5 * projected.next_round.target
+            or projected.sustainable_score < .7 * before.sustainable_score
+            or projected.next_round.safe_score < .7 * before.next_round.safe_score):
+        return False
+    if sell_index >= 0 and state.jokers[sell_index].key in (
+            GROWTH_JOKERS | {'burnt_joker', 'space_joker'}):
+        return False
+    if before.boss_round:
+        boss = projected.boss_round
+        if boss is None:
+            return False
+        if before.boss_weight >= .5:
+            if (boss.safe_score < 1.25 * boss.target
+                    or boss.clear_rate < max(.85, before.boss_round.clear_rate)):
+                return False
+        elif boss.safe_score < .7 * before.boss_round.safe_score:
+            return False
+    existing = sum(joker_income(j, state, before) for j in state.active_jokers)
+    income = sum(joker_income(j, after, projected) for j in after.active_jokers) - existing
+    cost = max(0, state.money - after.money)
+    return (existing < 4 and joker_income(joker, after, projected) > 0
+            and income > 0 and income * 3 * .65 >= 1.25 * cost)
+
+
+def reroll_investment_value(item, state, forecast):
+    """Discounted value of a funded search plan, never observed saved dollars."""
+    from strategy import joker_name
+    if (joker_name(item.name) not in ('reroll_surplus', 'reroll_glut')
+            or state.ante > 5 or state.money - item.price < 20
+            or forecast.coverage < 1.5 or forecast.clear_rate < .85
+            or state.has('bull') or state.has('bootstraps')):
+        return 0.
+    missing = forecast.profile.weaknesses
+    scale = any(k in missing for k in ('no_scaling', 'slow_scaling'))
+    multiplier = any(k in missing for k in ('no_multiplier_or_retrigger', 'unreliable_multiplier'))
+    searches = int(scale) + int(multiplier)
+    # At most two planned searches per round for six remaining shop rounds.
+    # The controller still reads the actual next price after redemption.
+    return min(24., 2 * investment_rounds(state) * searches * .8)
+
+
 def safe_income_discard(hand, state, current):
     """Trigger income while keeping a known finishing hand; no lucky draw."""
     from planning import advance_projected_discard

@@ -121,6 +121,15 @@ def distinctive_joker_effect(lines):
         matches.add('rocket')
     if re.search(r'\b1\s+free reroll\s+per shop\b', text):
         matches.add('chaos_the_clown')
+    # Both the complete growth condition and its amount distinguish this
+    # from Mad Joker's fixed Two Pair bonus (a perfect substring match).
+    if re.search(r'\bthis joker gains\s*\+\s*2\s+mult\s+if played hand contains\s+a two pair\b', text):
+        matches.add('spare_trousers')
+    # Hack has only four alphabetic tokens. Keep all four identifying ranks;
+    # the generic description matcher deliberately removes these numbers.
+    # 0r is an observed OCR form of "or" in this numeric row only.
+    if re.search(r'\bretrigger\s+each played\s+2[.,\s]+3[.,\s]+4[.,\s]+(?:or|0r)\s+5\b', text):
+        matches.add('hack')
     if len(matches) > 1:
         raise RuntimeError('Multiple distinct Joker effects are visible')
     if not matches:

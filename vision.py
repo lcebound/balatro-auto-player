@@ -101,8 +101,8 @@ def hand_slots(count: int, limit: int | None = None) -> list[int]:
     return [round(1034 + (index - (count - 1) / 2) * spacing) for index in range(count)]
 
 
-@lru_cache(maxsize=1)
-def _stone_position_templates():
+@lru_cache(maxsize=2)
+def _stone_position_templates(fine=False):
     """Mask rotation padding and suppress scanlines without discarding cracks."""
     source = next(t for c, t in special_corner_templates().items() if c.is_stone)
     source = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
@@ -113,7 +113,8 @@ def _stone_position_templates():
         h, w = resized.shape
         interior = np.zeros((h, w), np.uint8)
         interior[8:-8, 8:-8] = 255
-        for angle in (0, -8, -6, -4, -2, 2, 4, 6, 8):
+        angles = (-7, -5, -3, -1, 1, 3, 5, 7) if fine else (0, -8, -6, -4, -2, 2, 4, 6, 8)
+        for angle in angles:
             matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
             cos, sin = abs(matrix[0, 0]), abs(matrix[0, 1])
             rw, rh = int(h * sin + w * cos), int(h * cos + w * sin)
@@ -126,28 +127,37 @@ def _stone_position_templates():
 
 
 def stone_position(image, x):
-    """Locate a previously proven Stone Card; never substitute a suit pip."""
+    """Locate Stone texture; discovery additionally requires >= .85 confidence."""
     x0, y0 = max(0, x - 30), 655
     roi = image[y0:895, x0:x + 100]
     gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (5, 5), 1.2)
     best = (-1., (x, 725))
-    for template, mask, offset in _stone_position_templates():
-        h, w = template.shape
-        if h > gray.shape[0] or w > gray.shape[1]:
-            continue
-        scores = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED, mask=mask)
-        scores[~np.isfinite(scores)] = -1
-        # Constrain the transformed corner to this slot, rather than allowing
-        # a match on the adjacent card's exposed strip.
-        left = max(0, int(np.ceil(x - 25 - x0 - offset[0])))
-        right = min(scores.shape[1], int(np.floor(x + 25 - x0 - offset[0])) + 1)
-        if right <= left:
-            continue
-        _, score, _, location = cv2.minMaxLoc(scores[:, left:right])
-        corner = (round(x0 + left + location[0] + offset[0]),
-                  round(y0 + location[1] + offset[1]))
-        if score > best[0]:
-            best = score, corner
+    def search(variants):
+        nonlocal best
+        for template, mask, offset in variants:
+            h, w = template.shape
+            if h > gray.shape[0] or w > gray.shape[1]:
+                continue
+            scores = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED, mask=mask)
+            scores[~np.isfinite(scores)] = -1
+            # Constrain the transformed corner to this slot, rather than allowing
+            # a match on the adjacent card's exposed strip.
+            left = max(0, int(np.ceil(x - 25 - x0 - offset[0])))
+            right = min(scores.shape[1], int(np.floor(x + 25 - x0 - offset[0])) + 1)
+            if right <= left:
+                continue
+            _, score, _, location = cv2.minMaxLoc(scores[:, left:right])
+            corner = (round(x0 + left + location[0] + offset[0]),
+                      round(y0 + location[1] + offset[1]))
+            if score > best[0]:
+                best = score, corner
+
+    search(_stone_position_templates())
+    # Leftmost tilted Stone cards can fall between the two-degree samples.
+    # Refine a plausible texture match; keep both acceptance thresholds and
+    # the original location for an already strong match unchanged.
+    if .75 <= best[0] < .85:
+        search(_stone_position_templates(fine=True))
     if best[0] < .75:
         raise ObservationError(f'Stone corner at {x} is not verified ({best[0]:.2f}); recollect before selecting')
     return best
@@ -202,6 +212,21 @@ def read_hand(image: np.ndarray, count: int | None = None, *, identities=None,
             if score < .53:
                 score, rank_card, _, local = match_at(image, x, 725, radius=30, templates=templates, angles=(-8, -4, 4, 8))[0]
             if score < 0.53 or (identity_hint is not None and identity_hint.face_down):
+                if identity_hint is None:
+                    # A tilted new Stone Card has no rank/suit corner. The
+                    # shader can defeat the raw-color special template even
+                    # though the masked texture locator is unambiguous.
+                    # This only seeds collection: modifiers still need the
+                    # real tooltip, and selected state is verified separately.
+                    try:
+                        stone_score, stone_corner = stone_position(image, x)
+                    except ObservationError:
+                        pass
+                    else:
+                        if stone_score >= .85:
+                            result.append((Card(0, '?', enhancement='stone', rankless=True),
+                                           stone_score, stone_corner))
+                            continue
                 specials = match_at(image, x, 725, radius=30, templates=special_corner_templates(),
                                     angles=(0, -8, -4, 4, 8))[0]
                 special_score, special, _, position = specials

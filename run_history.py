@@ -20,7 +20,7 @@ BLIND_NAMES = ('small', 'big', 'boss')
 def code_version():
     files = ('strategy.py', 'planning.py', 'consumables.py', 'runner.py', 'bot.py', 'controller.py',
              'perception.py', 'item_identity.py', 'recovery.py', 'vision.py', 'joker_cache.py', 'hand_cache.py', 'plain_hand.py', 'shop_extras.py',
-             'hand_levels.py', 'engine_development.py', 'economy.py', 'runtime_issues.py', 'run_history.py',
+             'hand_levels.py', 'engine_development.py', 'economy.py', 'boss_policy.py', 'runtime_issues.py', 'run_history.py',
              'assets/ui/hand_play_control.png', 'assets/ui/hand_discard_control.png',
              'assets/ui/hand_sort_control.png')
     hashes = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in files}

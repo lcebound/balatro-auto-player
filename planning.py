@@ -111,27 +111,28 @@ class ShopForecast:
     fragile_score: float | None = None
     fragile_loss_probability: float = 0
     development_score: float | None = None
+    boss_weight: float = 1.
 
     @property
     def weak(self):
         return (self.next_round.safe_score < self.next_round.target * 1.15
                 or self.sustainable_score < self.next_round.target * 1.15
-                or (self.boss_round is not None and
-                    self.boss_round.safe_score < self.boss_round.target * 1.1))
+                or self.coverage < 1.1)
 
     @property
     def coverage(self):
         values = [min(self.next_round.safe_score, self.sustainable_score) /
                   max(1, self.next_round.target)]
         if self.boss_round is not None:
-            values.append(self.boss_round.safe_score / max(1, self.boss_round.target))
+            boss = self.boss_round.safe_score / max(1, self.boss_round.target)
+            values.append((1 - self.boss_weight) * values[0] + self.boss_weight * boss)
         return min(values)
 
     @property
     def clear_rate(self):
         rates = [self.next_round.clear_rate]
         if self.boss_round is not None:
-            rates.append(self.boss_round.clear_rate)
+            rates.append((1 - self.boss_weight) * rates[0] + self.boss_weight * self.boss_round.clear_rate)
         return min(rates)
 
 
@@ -187,7 +188,7 @@ def replacement_reduces_survival(before, after):
         return True
     if before.coverage < 1.1 and after.coverage + .01 < before.coverage:
         return True
-    if before.boss_round and after.boss_round:
+    if before.boss_round and after.boss_round and before.boss_weight >= .5:
         old = before.boss_round.safe_score / max(1, before.boss_round.target)
         new = after.boss_round.safe_score / max(1, after.boss_round.target)
         if old < 1.1 and new + .01 < old:
@@ -321,7 +322,48 @@ def _round_state(state, boss, target):
                                             - probe.joker_count('troubadour')))
     elif _boss(probe) == 'manacle':
         probe = replace(probe, hand_size=max(1, hand_size - 1))
+    elif _boss(probe) == 'ox' and probe.played_types:
+        probe = replace(probe, boss_target_hand=max(probe.played_types, key=probe.played_types.get))
+    elif _boss(probe) == 'verdant_leaf':
+        from boss_policy import choose_verdant_sale, after_joker_sale
+        index = choose_verdant_sale(probe)
+        if index is not None:
+            probe = after_joker_sale(probe, index, disable_leaf=True, project=True)
     return probe
+
+
+def advance_projected_madness(state, sample=0):
+    """One bounded destruction branch, never a runtime roster update.
+
+    The source increments each physical Madness on non-Boss selection and
+    can destroy any other non-eternal card, including another Madness. Copy
+    effects do not add growth. Resource grants whose timing is ambiguous
+    after destruction are bounded by both the old and surviving budgets.
+    """
+    if not state.has('madness') or state.boss or state.blind_index == 1:
+        return state
+    from strategy import joker_hand_size_delta
+    jokers = list(state.jokers)
+    removed = set()
+    ordinal = 0
+    for index, joker in enumerate(jokers):
+        if index in removed or joker.debuffed or joker.key != 'madness':
+            continue
+        jokers[index] = replace(joker, value=max(1., joker.value) + .5)
+        victims = [i for i, other in enumerate(jokers)
+                   if i != index and i not in removed and not other.get('eternal')]
+        if victims:
+            removed.add(victims[(sample + ordinal) % len(victims)])
+        ordinal += 1
+    surviving = tuple(j for i, j in enumerate(jokers) if i not in removed)
+    after = replace(state, jokers=surviving,
+        total_joker_slots=state.total_joker_slots - sum(state.jokers[i].edition == 'negative' for i in removed),
+        hand_size=max(1, state.hand_size + joker_hand_size_delta(state.jokers, surviving)))
+    budgets = _shop_round_state(after)
+    # Destruction is not a sale: no sale cash or Campfire growth. Recomputing
+    # resources must not grant a copier a new blind-start trigger retroactively.
+    return replace(after, hands_left=min(state.hands_left, budgets.hands_left),
+                   discards_left=min(state.discards_left, budgets.discards_left))
 
 
 def advance_projected_blind_start(state):
@@ -566,6 +608,7 @@ def advance_projected_play(state, hand, indices, estimate):
             data['remaining'] = 5 if remaining == 0 else remaining - 1
         jokers.append(replace(j, value=value, data=tuple(data.items())))
     return replace(state, jokers=tuple(jokers), levels=levels, deck_cards=tuple(deck), played_types=history,
+                   money=state.money + estimate.cash,
                    round_played_types=round_history, boss_seen_types=frozenset(round_history),
                    boss_first_hand_done=True, hands_left=max(0, state.hands_left - 1),
                    boss_target_hand=(category if _boss(state) == 'mouth' and
@@ -600,6 +643,7 @@ def conditional_multiplier_hits(hand, indices, state):
 
 
 def forecast_round(state, boss='', target=0, samples=6):
+    from boss_policy import forecast_draw, forecast_boss_turn
     from engine_development import blue_planet_yield
     start = _round_state(state, boss, target)
     deck = tuple(replace(c, debuffed=False, face_down=False) for c in full_deck(state))
@@ -612,8 +656,9 @@ def forecast_round(state, boss='', target=0, samples=6):
         return sum(_draw_best_plan(h, opened)[1].score for h in examples)
     order = max(_shop_order_variants(start), key=order_score)
     start = replace(start, jokers=order)
-    marble = start.effect_count('marble_joker')
-    start = advance_projected_blind_start(start)
+    destructive = start.has('madness') and not start.boss and start.blind_index != 1
+    if not destructive:
+        start = advance_projected_blind_start(start)
     preferred = engine_profile(start).preferred_hand
     totals, hand_scores, categories = [], [], Counter()
     growth, real_plays, level_gains = Counter(), Counter(), Counter()
@@ -621,6 +666,10 @@ def forecast_round(state, boss='', target=0, samples=6):
     blue_planets = 0.
     has_blue = any(c.seal.lower() == 'blue' for c in deck)
     for sample in range(samples):
+        opened = (advance_projected_blind_start(advance_projected_madness(start, sample))
+                  if destructive else start)
+        marble = opened.effect_count('marble_joker')
+        sample_preferred = engine_profile(opened).preferred_hand if destructive else preferred
         pile = list(deck)
         rng = Random(724901 + sample * 101)
         rng.shuffle(pile)
@@ -635,25 +684,30 @@ def forecast_round(state, boss='', target=0, samples=6):
         if marble:
             pile.extend([Card(2, 'S', enhancement='stone')] * marble)
             rng.shuffle(pile)
-        hand, pile = pile[:start.hand_size], pile[start.hand_size:]
-        probe, total, floor_total = start, 0.0, 0.0
+        boss_rng = Random(181801 + sample * 101)
+        hand, pile = forecast_draw(pile[:opened.hand_size], opened, boss_rng, 'initial'), pile[opened.hand_size:]
+        probe, total, floor_total = opened, 0.0, 0.0
         training_done = False
-        for _ in range(start.hands_left):
+        for _ in range(opened.hands_left):
             if not hand:
                 break
             probe = replace(probe, draw_pile_size=len(pile), round_score=total)
+            probe = forecast_boss_turn(probe, hand, boss_rng)
             indices, estimate = _draw_best_plan(hand, probe)
             # A discard hold is selected without consulting the draw pile.
             while (probe.discards_left > 0 and pile and estimate.score <
                    max(1, target - total) / max(1, probe.hands_left) * .95):
-                keep = forecast_hold(hand, probe, preferred)
+                keep = forecast_hold(hand, probe, sample_preferred)
                 discarded = [c for i, c in enumerate(hand) if i not in keep]
-                draw = min(len(discarded), len(pile))
+                from boss_policy import discard_draw_count
+                draw = discard_draw_count(probe, len(discarded), len(pile))
                 if not draw:
                     break
-                hand = [hand[i] for i in keep] + pile[:draw]
+                hand = [hand[i] for i in keep] + forecast_draw(pile[:draw], probe, boss_rng, 'discard')
                 pile = pile[draw:]
                 probe = advance_projected_discard(probe, discarded, draw)
+                if _boss(probe) == 'cerulean_bell':
+                    probe = forecast_boss_turn(probe, hand, boss_rng)
                 indices, estimate = _draw_best_plan(hand, probe)
             earned = _safe_play_score(hand, indices, estimate, probe)
             if has_blue and not training_done:
@@ -700,10 +754,10 @@ def forecast_round(state, boss='', target=0, samples=6):
                             growth['constellation'] += (.1 * planets *
                                 after.joker_count('constellation') / samples)
                     training_done = True
-            draw = min(max(0, start.hand_size - len(held)), len(pile))
+            draw = min(max(0, opened.hand_size - len(held)), len(pile))
             if _boss(probe) == 'serpent':
                 draw = min(3, len(pile))
-            hand, pile, probe = held + pile[:draw], pile[draw:], after
+            hand, pile, probe = held + forecast_draw(pile[:draw], after, boss_rng, 'play'), pile[draw:], after
         totals.append(total)
     ordered = sorted(totals)
     lower = ordered[max(0, len(ordered) // 4)]
@@ -800,11 +854,19 @@ def shop_forecast(state):
         horizon = max(1, min(3, 9 - state.ante))
         loss_probability = 1 - (1 - _probability(state, 6)) ** horizon
         sustainable = min(sustainable, (1 - loss_probability) * sustainable + loss_probability * fragile_score)
+    from boss_policy import future_boss_weight
     result = ShopForecast(next_round, boss_round, sustainable,
                           engine_profile(state, next_round.frequencies,
-                                         getattr(next_round, 'conditional_xmult_rates', ())), fragile_score, loss_probability)
+                                         getattr(next_round, 'conditional_xmult_rates', ())), fragile_score, loss_probability,
+                          boss_weight=future_boss_weight(state.ante))
     from engine_development import development_score
     result = replace(result, development_score=development_score(state, result))
+    if (4 <= state.ante < 8 and result.profile.growth > 0
+            and result.development_score <= result.sustainable_score * 1.12):
+        # A Runner growing only 2.5 Chips/round did not keep a Two Pair engine
+        # on pace. Owning a scaler alone does not remove development pressure.
+        result = replace(result, profile=replace(result.profile,
+            weaknesses=result.profile.weaknesses + ('slow_scaling',)))
     _FORECAST_CACHE[key] = result
     while len(_FORECAST_CACHE) > 80:
         _FORECAST_CACHE.popitem(last=False)
@@ -894,6 +956,7 @@ def improve_play_continuation(hand, state, best, contenders):
         draw_count = min(len(candidate.indices), available)
         next_scores = []
         for sample_index, pile in enumerate(permutations):
+            next_draw = draw_count
             new_hand = held + pile[:draw_count]
             probe = replace(after, draw_pile_size=max(0, available - draw_count),
                             round_score=state.round_score + candidate.estimate.score)
@@ -909,6 +972,13 @@ def improve_play_continuation(hand, state, best, contenders):
                 next_draw = min(3, available)
                 new_hand = held + pile[:next_draw]
                 probe = replace(probe, draw_pile_size=max(0, available - next_draw))
+            from boss_policy import forecast_draw, forecast_boss_turn
+            # The continuation cannot plan with a hidden front revealed only
+            # in the sampled deck. Held cards retain their observed visibility.
+            retained_count = len(new_hand) - next_draw
+            new_hand = new_hand[:retained_count] + forecast_draw(new_hand[retained_count:], probe,
+                Random(180401 + sample_index * 97 + state.seed), 'play')
+            probe = forecast_boss_turn(probe, new_hand, Random(180501 + sample_index * 97 + state.seed))
             _, estimate = _draw_best_plan(new_hand, probe)
             next_scores.append(estimate.score)
         expected_next = sum(next_scores) / len(next_scores)
@@ -944,7 +1014,8 @@ def second_discard_gain(original, keep, draws, first_scores, unseen, sample_stat
         keep_again = forecast_hold(hand, sample_state, preferred)
         count = len(hand) - len(keep_again)
         limit = len(pool) if sample_state.draw_pile_size < 0 else min(len(pool), sample_state.draw_pile_size)
-        count = min(count, limit)
+        from boss_policy import discard_draw_count, forecast_draw
+        count = discard_draw_count(sample_state, count, limit)
         if not count:
             gains.append(0)
             continue
@@ -952,8 +1023,8 @@ def second_discard_gain(original, keep, draws, first_scores, unseen, sample_stat
         cost = _discard_cost(sample_state, first_score)
         outcomes = []
         for second_sample in range(4):
-            new = [hand[i] for i in keep_again] + Random(
-                91291 + sample * 97 + second_sample * 997 + state.seed).sample(pool, count)
+            rng = Random(91291 + sample * 97 + second_sample * 997 + state.seed)
+            new = [hand[i] for i in keep_again] + forecast_draw(rng.sample(pool, count), after, rng, 'discard')
             outcomes.append(_draw_best_plan(new, after)[1].score)
         gains.append(max(0, sum(outcomes) / len(outcomes) - first_score - cost))
     # A single sampled improvement is not proof; leave most of that option's

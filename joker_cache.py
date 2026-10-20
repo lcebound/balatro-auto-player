@@ -29,7 +29,7 @@ swashbuckler troubadour golden_ticket mr_bones hanging_chad
 rough_gem bloodstone arrowhead onyx_agate photograph reserved_parking
 mail_in_rebate to_the_moon ancient_joker walkie_talkie the_idol
 the_duo the_trio the_family the_order the_tribe stuntman
-invisible_joker satellite shoot_the_moon drivers_license cartomancer
+invisible_joker satellite shoot_the_moon drivers_license cartomancer madness
 astronomer burnt_joker bull bootstraps cavendish card_sharp smeared_joker
 baseball_card blueprint brainstorm chicot triboulet
 '''.split()) - {'fortune_teller', 'swashbuckler', 'drivers_license'}
@@ -37,7 +37,7 @@ baseball_card blueprint brainstorm chicot triboulet
 # These targets/lifetimes change at cashout or at the next blind. The others
 # still need a visible identity/edition/debuff check, but not a new tooltip.
 ROUND_CHANGING = frozenset({'ancient_joker', 'the_idol', 'mail_in_rebate',
-                           'gros_michel', 'cavendish', 'invisible_joker'})
+                           'gros_michel', 'cavendish', 'invisible_joker', 'madness'})
 
 # Verified triggers in the installed game's card.lua. These counters change
 # through another action (or cashout), not merely by playing/discarding cards.

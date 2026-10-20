@@ -53,6 +53,8 @@ HAND_ALIASES = {
     "three of a kind": "three_kind", "straight": "straight",
     "flush": "flush", "full house": "full_house",
     "four of a kind": "four_kind", "straight flush": "straight_flush",
+    # The game changes only the displayed title for a high Straight Flush.
+    "royal flush": "straight_flush",
     "five of a kind": "five_kind", "flush house": "flush_house",
     "flush five": "flush_five",
 }
@@ -510,6 +512,8 @@ def _card_debuffed(card: Card, state: RunState) -> bool:
     if card.debuffed:
         return True
     boss = _boss(state)
+    if boss == 'verdant_leaf':
+        return True
     suit_bosses = {"goad": "S", "club": "C", "head": "H", "window": "D"}
     if suit_bosses.get(boss) in _effective_suits(card, state):
         return True
@@ -759,9 +763,9 @@ def _joker_global_effect(joker: Joker, pattern: HandPattern,
         steel_count = sum(card.enhancement == "steel" for card in state.remaining_deck)
         return 0, 0, 1 + 0.2 * max(steel_count, joker.value), 0
     if key == "bull":
-        return 2 * state.money, 0, 1, 0
+        return 2 * max(0, state.money), 0, 1, 0
     if key == "bootstraps":
-        return 0, 2 * (state.money // 5), 1, 0
+        return 0, 2 * (max(0, state.money) // 5), 1, 0
     if key == "banner":
         return 30 * state.discards_left, 0, 1, 0
     if key == "mystic_summit" and state.discards_left == 0:
@@ -975,6 +979,10 @@ def _score_hand_core(cards: Sequence[Card], state: RunState | None = None,
         cash -= state.money
     if _boss(state) == "tooth":
         cash -= len(cards)
+    if cash < 0:
+        # Boss deductions precede scoring. Bull/Bootstraps cannot retain the
+        # dollars removed by Ox or Tooth during this same hand.
+        state = replace(state, money=state.money + cash)
 
     hiker = state.effect_count('hiker')
     for index in pattern.scoring:
@@ -1544,7 +1552,8 @@ def _discard_candidates(hand: Sequence[Card], state: RunState, *, include_discar
     for size in range(1, min(5, len(matching)) + 1):
         dropped = set(matching[:size])
         offer((i for i in range(count) if i not in dropped), 'Mail-In Rebate matching discard')
-    return candidates
+    from boss_policy import legal_discard_keeps
+    return legal_discard_keeps(hand, state, candidates)
 
 
 def suit_coverage(cards, state):
@@ -1755,7 +1764,8 @@ def _draw_best_plan(hand: Sequence[Card], state: RunState):
             plans.add(tuple(sorted((*core, *rest[:4 - len(core)]))))
     candidates = ((core, score_hand([hand[i] for i in core], state,
                                    [card for i, card in enumerate(hand) if i not in core]))
-                  for core in sorted(plans) if core)
+                  for core in sorted(plans) if core
+                  and (state.forced_card_index < 0 or state.forced_card_index in core))
     risk = (state.score_needed > 0 and state.score_mode == 'expected' and
             (_boss(state) == 'hook' or state.has('misprint') or state.has('bloodstone') or state.has('space_joker')
              or any(c.enhancement == 'lucky' or c.face_down for c in hand)))
@@ -1808,9 +1818,12 @@ def _last_hand_discard(hand, state, current, unseen):
     draws = {}
     best, best_key = None, None
     from planning import advance_projected_discard
+    from boss_policy import discard_draw_count, forecast_draw
+    from boss_policy import legal_discard_keeps
+    candidates = legal_discard_keeps(hand, state, candidates)
     for keep, reason in candidates.items():
         discarded = tuple(i for i in range(len(hand)) if i not in keep)
-        draw_count = min(len(discarded), draw_limit)
+        draw_count = discard_draw_count(state, len(discarded), draw_limit)
         if not draw_count:
             continue
         if draw_count not in draws:
@@ -1818,7 +1831,9 @@ def _last_hand_discard(hand, state, current, unseen):
                                  else tuple(tuple(rng.sample(unseen, draw_count)) for _ in range(48)))
         retained = [hand[i] for i in keep]
         sampled = advance_projected_discard(state, [hand[i] for i in discarded], draw_count)
-        scores = [_draw_estimate([*retained, *draw], sampled) for draw in draws[draw_count]]
+        scores = [_draw_estimate([*retained, *forecast_draw(draw, sampled,
+                  Random(_sample_seed(hand, state) + n), 'discard')], sampled)
+                  for n, draw in enumerate(draws[draw_count])]
         wins = sum(score >= state.score_needed for score in scores) / len(scores)
         expected = sum(scores) / len(scores)
         # After another miss, keeping the best core and more draw capacity is
@@ -1913,31 +1928,36 @@ def decide_discard(hand: Sequence[Card], state: RunState | None = None,
     # Every candidate with the same draw count sees the same sampled cards.
     # This reduces variance when comparing close discard plans.
     draw_limit = min(len(unseen), state.draw_pile_size if state.draw_pile_size >= 0 else len(unseen))
+    from boss_policy import discard_draw_count, forecast_draw
     draw_sets = {
         draw_count: tuple(
             tuple(rng.sample(unseen, min(draw_count, draw_limit)))
             for _ in range(sample_count)
         )
-        for draw_count in {len(hand) - len(keep) for keep in candidates}
+        for draw_count in {discard_draw_count(state, len(hand) - len(keep), draw_limit) for keep in candidates}
         if draw_limit > 0
     }
 
     for keep, reason in candidates.items():
         retained = [hand[i] for i in keep]
-        draw_count = len(hand) - len(keep)
+        draw_count = discard_draw_count(state, len(hand) - len(keep), draw_limit)
         if draw_count not in draw_sets:
             continue
         scores: list[float] = []
         discarded_cards = [c for i, c in enumerate(hand) if i not in keep]
         sample_state = advance_projected_discard(state, discarded_cards, min(draw_count, draw_limit))
-        for draw in draw_sets[draw_count]:
+        masked_draws = [forecast_draw(draw, sample_state,
+                        Random(_sample_seed(hand, state) + n), 'discard')
+                        for n, draw in enumerate(draw_sets[draw_count])]
+        for draw in masked_draws:
             new_hand = [*retained, *draw]
             scores.append(_draw_estimate(new_hand, sample_state))
         expected = sum(scores) / len(scores)
         utility = _survival_utility(scores, state) - cost
         follow_up = 0
         if (state.discards_left >= 2 and state.score_needed > 0 and
-                current.estimate.score < pace * .8 and len(hand) <= 13):
+                current.estimate.score < pace * .8 and len(hand) <= 13
+                and not any(c.face_down for draw in masked_draws for c in draw)):
             from planning import second_discard_gain
             follow_up = second_discard_gain(hand, keep, draw_sets[draw_count], scores,
                                             unseen, sample_state, state)
@@ -2408,7 +2428,7 @@ def decide_shop(items: Sequence[ShopItem], state: RunState, *,
     """Compare complete rounds, Boss exposure and permanent engine support."""
     from planning import (shop_forecast, XMULT_JOKERS, GROWTH_JOKERS, ECONOMY_JOKERS,
                           replacement_reduces_survival, growth_opportunity)
-    from economy import economy_value
+    from economy import economy_value, safe_economy_investment
     state = _shop_round_state(state)
     before = shop_forecast(state)
     economy_before = economy_value(state, before)
@@ -2423,6 +2443,13 @@ def decide_shop(items: Sequence[ShopItem], state: RunState, *,
     best_progress = 0.
     for index, item in enumerate(items):
         kind = joker_name(item.kind)
+        if (kind == 'tarot' and joker_name(item.name) == 'the_devil'
+                and state.ante >= 8 and state.blind_index == 1
+                and not any(state.has(k) for k in ('vampire', 'golden_ticket',
+                                                  'drivers_license', 'fortune_teller'))):
+            # End-of-round Gold cash arrives after the Ante-8 goal. Without
+            # an observed scoring/use synergy it cannot fund a final rescue.
+            continue
         if kind == 'voucher' or kind.endswith('_pack'):
             from shop_extras import extra_is_worth_considering
             if not extra_is_worth_considering(item, state, before):
@@ -2451,7 +2478,7 @@ def decide_shop(items: Sequence[ShopItem], state: RunState, *,
             gain += 8 * log2((projected.next_round.mean_score + 20) /
                              (before.next_round.mean_score + 20))
             if before.boss_round and projected.boss_round:
-                gain += 15 * log2((projected.boss_round.safe_score + 20) /
+                gain += 15 * before.boss_weight * log2((projected.boss_round.safe_score + 20) /
                                   (before.boss_round.safe_score + 20))
             gain += 10 * log2((projected.sustainable_score + 20) /
                               (before.sustainable_score + 20))
@@ -2459,17 +2486,29 @@ def decide_shop(items: Sequence[ShopItem], state: RunState, *,
             future_before = getattr(before, 'development_score', None) or before.sustainable_score
             future_after = getattr(projected, 'development_score', None) or projected.sustainable_score
             development_weight = 4 if emergency else 18
-            if (kind == 'joker' and joker.key in GROWTH_JOKERS and state.ante <= 3
+            if (kind == 'joker' and joker.key in GROWTH_JOKERS and state.ante <= 6
                     and not emergency and projected.coverage >= 1.25
                     and projected.clear_rate >= .85 and future_after > future_before
                     and dict(projected.next_round.growth_per_round).get(joker.key, 0) > 0):
-                # The early Square offer kept >7x coverage, but lost to a
-                # minor Tarot because its growth projection had too little weight.
-                # Pay for demonstrated growth while immediate survival has
-                # headroom; do not invent future offers or activations.
+                # Supported growth can still repay its cost in Antes 4-6.
+                # Require simulated net growth and surviving immediate coverage;
+                # the development projection already limits the remaining horizon.
                 development_weight = 28
             gain += development_weight * log2((future_after + 20) / (future_before + 20))
             after_rate = getattr(projected, 'clear_rate', getattr(projected.next_round, 'clear_rate', 1.))
+            if kind == 'voucher':
+                if (emergency and projected.coverage <= before.coverage + .01
+                        and after_rate <= before_rate and immediate_gain < .5):
+                    # Interest/search investments cannot spend the cash needed
+                    # to find an immediate rescue for an already lethal blind.
+                    continue
+                if (state.ante <= 2 and len(state.active_jokers) < 2 and after.money < 5
+                        and not (projected.coverage > before.coverage
+                                 and after_score >= baseline * 1.25
+                                 and after_rate >= before_rate)):
+                    # A marginal resource upgrade must leave a starter budget.
+                    # Substantial immediate help can still spend the last cash.
+                    continue
             gain += 24 * (after_rate - before_rate)
             gain = max(-100, min(120, gain))
             if kind == 'planet':
@@ -2494,7 +2533,16 @@ def decide_shop(items: Sequence[ShopItem], state: RunState, *,
                 # Do not improve an easy blind at the expense of an already
                 # lethal Boss or the engine after temporary support expires.
                 continue
+            if kind == 'joker' and joker.key == 'credit_card':
+                # Negative-cash purchases are not supported by this planner.
+                # Do not pay for unused borrowing unless its edition/slot
+                # synergy produces a real forecast scoring improvement.
+                if immediate_gain < .5 and future_after <= future_before:
+                    continue
             prior = (0. if kind == 'joker' and joker.key in ECONOMY_JOKERS else _item_value(item, state))
+            if kind == 'voucher':
+                from economy import reroll_investment_value
+                prior = max(prior, reroll_investment_value(item, state, before))
             if kind.endswith('_pack'):
                 from shop_extras import sealed_pack_value
                 prior = sealed_pack_value(item, state, before)
@@ -2545,6 +2593,14 @@ def decide_shop(items: Sequence[ShopItem], state: RunState, *,
                         and projected.coverage <= before.coverage + .03):
                     continue  # an investment must not occupy the rescue budget
                 prior += economic_gain * (.25 if emergency else 1.)
+                if (gain < 0 and not emergency and economic_gain > 0
+                        and joker.key in ECONOMY_JOKERS
+                        and safe_economy_investment(state, after, before, projected,
+                                                   joker, replacement)):
+                    # Stencil's excess Mult is useful investment capital when
+                    # the reduced engine still safely clears. Keep the actual
+                    # score, cash cost and future income estimates unchanged.
+                    gain *= .1
             if kind == 'planet':
                 prior *= .35
             if kind in ('tarot', 'spectral'):
@@ -2564,6 +2620,15 @@ def decide_shop(items: Sequence[ShopItem], state: RunState, *,
                     continue
                 if needs_starter and after.money < 12 and joker_name(item.name) not in ('judgement', 'the_soul'):
                     continue
+                if (kind == 'tarot' and state.ante <= 2 and after.money < 5
+                        and before.coverage >= 1.25
+                        and joker_name(item.name) in ('the_devil','the_star','the_moon','the_sun','the_world','the_lovers')
+                        and not any(state.has(k) for k in ('fortune_teller','vampire','golden_ticket'))):
+                    suited_engine = (joker_name(item.name) != 'the_devil' and (
+                        'flush' in before.profile.preferred_hand or any(state.has(k) for k in
+                        ('lusty_joker','greedy_joker','wrathful_joker','gluttonous_joker','flower_pot'))))
+                    if not suited_engine:
+                        continue  # Keep early scoring-Joker/interest capital.
             if kind == 'tarot' and weak and joker_name(item.name) in ('the_hermit', 'temperance'):
                 prior *= .6
             cash_cost = _money_value(state.money, state.ante, state) - _money_value(after.money, state.ante, state)
@@ -2590,9 +2655,9 @@ def decide_shop(items: Sequence[ShopItem], state: RunState, *,
     needs_headroom = before.coverage < 1.75 or before.sustainable_score < next_blind_target(state) * 1.3
     weaknesses = getattr(getattr(before, 'profile', None), 'weaknesses', ())
     needs_development = (3 <= state.ante < 8 and any(key in weaknesses for key in
-                         ('low_chips', 'low_mult', 'no_scaling', 'no_multiplier_or_retrigger', 'unreliable_multiplier')))
+                         ('low_chips', 'low_mult', 'no_scaling', 'slow_scaling', 'no_multiplier_or_retrigger', 'unreliable_multiplier')))
     growth_pressure = (4 <= state.ante < 8 and before.coverage < 1.5
-                       and any(k in weaknesses for k in ('no_scaling','no_multiplier_or_retrigger','unreliable_multiplier')))
+                       and any(k in weaknesses for k in ('no_scaling','slow_scaling','no_multiplier_or_retrigger','unreliable_multiplier')))
     if needs_development and not weak and state.money >= 31:
         # Pay at most one interest tier to search for a missing engine part;
         # reserve the offered Joker's budget separately. Bull/Bootstraps keep
